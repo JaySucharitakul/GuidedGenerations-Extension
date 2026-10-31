@@ -1,61 +1,10 @@
 /**
- * @file Group-chat character picker.
- *
- * Centralises how Guided Generations asks the user "which group member
- * should respond next?". If STGroupResponderSelector (GRS) is installed and
- * exposes its picker API, we delegate to it — that is its whole reason to
- * exist. Otherwise we fall back to GG's own selector (a small popup that
- * shows each member with their avatar).
- *
- * The cross-extension contract is the ST-sanctioned `globalThis.<Name>`
- * pattern (the same one `globalThis.quickReplyApi` uses):
- *
- *     globalThis.STGroupResponderSelector.pickCharacter(): Promise<{chid, name}|null>
- *
- * GG only ever consumes that — it never assumes GRS is present.
+ * Shared group member selection using SillyTavern's built-in buttons dialog.
+ * Used by Guided Response and Fun Prompts, including on mobile.
  */
+import { debugLog, getContext } from '../persistentGuides/guideExports.js';
 
-import { extensionName, debugLog, getContext } from '../persistentGuides/guideExports.js';
-
-/**
- * @typedef GroupMember
- * @property {number} chid
- * @property {string} name
- * @property {string|null} avatar
- * @property {string} triggerArg  Argument to pass to ST's `/trigger` command
- *                                (name as JSON string, or index as a bare
- *                                number when the name starts with a digit).
- */
-
-/**
- * Look up GRS's published picker, if any.
- * @returns {{pickCharacter: () => Promise<{chid:number,name:string}|null>}|null}
- */
-function getGrsPicker() {
-    try {
-        const api = globalThis.STGroupResponderSelector;
-        return api && typeof api.pickCharacter === 'function' ? api : null;
-    } catch {
-        return null;
-    }
-}
-
-/**
- * Build the `/trigger` argument for a member. ST's `/trigger` accepts either
- * a member index or a name string; we send the index when the name would
- * otherwise be misparsed as a number (i.e. starts with a digit).
- */
-function triggerArgFor(index, name) {
-    return /^\d/.test(name) && index >= 0 ? String(index) : JSON.stringify(name);
-}
-
-/**
- * Read the current group's members from ST context, each pre-tagged with
- * the `/trigger` argument that would target them.
- * @returns {GroupMember[]}
- */
-function getGroupMembers() {
-    const context = getContext();
+function getGroupMembers(context) {
     if (!context?.groupId || !Array.isArray(context.groups)) return [];
 
     const group = context.groups.find(g => g.id === context.groupId);
@@ -76,202 +25,34 @@ function getGroupMembers() {
             name,
             avatar: memberAvatar,
             muted: disabled.includes(memberAvatar),
-            triggerArg: triggerArgFor(index, name),
+            triggerArg: String(index),
         });
     });
     return members;
 }
 
-/**
- * GG's own picker popup. Builds a small centered dialog with one row per
- * group member (avatar + name) and resolves with the clicked member, or
- * null if the user dismisses the dialog without choosing.
- *
- * @param {GroupMember[]} members
- * @returns {Promise<GroupMember|null>}
- */
-function ggFallbackPicker(members) {
-    return new Promise((resolve) => {
-        if (!members.length) {
-            resolve(null);
-            return;
-        }
-
-        let settled = false;
-        /** @type {null | (() => void)} Cleanup for listeners attached while open. */
-        let cleanup = null;
-        const finish = (value) => {
-            if (settled) return;
-            settled = true;
-            if (cleanup) cleanup();
-            dialog.remove();
-            resolve(value);
-        };
-
-        const dialog = document.createElement('div');
-        dialog.className = 'gg-group-picker-dialog';
-        dialog.setAttribute('role', 'dialog');
-
-        const header = document.createElement('div');
-        header.className = 'gg-group-picker-header';
-        const title = document.createElement('h3');
-        title.textContent = 'Select member to respond as';
-        const closeBtn = document.createElement('button');
-        closeBtn.type = 'button';
-        closeBtn.className = 'gg-group-picker-close';
-        closeBtn.innerHTML = '&times;';
-        closeBtn.setAttribute('aria-label', 'Cancel');
-        closeBtn.addEventListener('click', () => finish(null));
-        header.append(title, closeBtn);
-
-        const list = document.createElement('ul');
-        list.className = 'gg-group-picker-list';
-
-        for (const member of members) {
-            const li = document.createElement('li');
-            li.className = 'gg-group-picker-item';
-            li.tabIndex = 0;
-            if (member.muted) li.classList.add('gg-group-picker-item--muted');
-
-            const img = document.createElement('img');
-            img.className = 'gg-group-picker-avatar';
-            img.alt = '';
-            if (member.avatar) {
-                img.src = `/thumbnail?type=avatar&file=${encodeURIComponent(member.avatar)}`;
-            }
-            img.addEventListener('error', () => { img.style.visibility = 'hidden'; });
-
-            const name = document.createElement('span');
-            name.className = 'gg-group-picker-name';
-            name.textContent = member.name;
-
-            li.append(img, name);
-            const choose = () => finish(member);
-            li.addEventListener('click', choose);
-            li.addEventListener('keydown', (e) => {
-                if (e.key === 'Enter' || e.key === ' ') {
-                    e.preventDefault();
-                    choose();
-                }
-            });
-            list.appendChild(li);
-        }
-
-        dialog.append(header, list);
-        document.body.append(dialog);
-
-        // Close on outside click. Ignore clicks inside the dialog, and ignore
-        // the originating click that opened the picker (still propagating).
-        let suppressNextClick = true;
-        setTimeout(() => { suppressNextClick = false; }, 0);
-        const onDocumentClick = (e) => {
-            if (suppressNextClick) return;
-            if (!dialog.contains(/** @type {Node} */ (e.target))) {
-                finish(null);
-            }
-        };
-        document.addEventListener('click', onDocumentClick);
-
-        /** @param {KeyboardEvent} e */
-        const onKeydown = (e) => {
-            if (e.key === 'Escape') {
-                e.preventDefault();
-                finish(null);
-            }
-        };
-        document.addEventListener('keydown', onKeydown);
-
-        // Position the dialog like GG's tools menu: its bottom edge sits a
-        // few px above #gg-action-button-container (the GG button row), so it
-        // floats over the textarea instead of being glued to the screen
-        // bottom. Horizontally centered in the viewport. Falls back to
-        // #send_form's top, then to a small gap from the viewport bottom.
-        const updatePosition = () => {
-            const actionContainer = document.getElementById('gg-action-button-container');
-            const sendForm = document.getElementById('send_form');
-            const anchorEl = actionContainer || sendForm;
-            const gap = 5;
-            let bottomPx;
-            if (anchorEl) {
-                const anchorTop = anchorEl.getBoundingClientRect().top;
-                bottomPx = window.innerHeight - anchorTop + gap;
-            } else {
-                bottomPx = gap;
-            }
-            dialog.style.bottom = `${bottomPx}px`;
-            dialog.style.left = '50%';
-            dialog.style.transform = 'translateX(-50%)';
-        };
-        updatePosition();
-        window.addEventListener('resize', updatePosition);
-
-        cleanup = () => {
-            document.removeEventListener('click', onDocumentClick);
-            document.removeEventListener('keydown', onKeydown);
-            window.removeEventListener('resize', updatePosition);
-        };
-
-        // Re-measure once the dialog is laid out, in case fonts/images shift
-        // the anchor height on the same frame.
-        requestAnimationFrame(updatePosition);
-
-        // Focus the first item so keyboard users can pick immediately.
-        const firstItem = list.querySelector('.gg-group-picker-item');
-        if (firstItem && typeof firstItem.focus === 'function') {
-            firstItem.focus();
-        }
-    });
-}
 
 /**
- * Ask the user which group member should respond next.
- *
- * - If STGroupResponderSelector is installed and publishes
- *   `globalThis.STGroupResponderSelector.pickCharacter`, use it.
- * - Otherwise open GG's own selector (with avatars).
- *
- * Returns the chosen member (with a ready-to-use `triggerArg`), or null if
- * the user cancelled.
- *
- * @returns {Promise<GroupMember|null>}
+ * Return the chosen group member, or null when cancelled/unavailable.
+ * Preserve the original group index so numeric and duplicate names can be
+ * targeted without interpreting character names as slash-command arguments.
  */
 export async function pickGroupMember() {
-    const members = getGroupMembers();
+    const context = getContext();
+    if (typeof context?.executeSlashCommandsWithOptions !== 'function') return null;
+    const members = getGroupMembers(context);
     if (!members.length) {
         debugLog('[GroupSelection] No group members available; picker skipped.');
         return null;
     }
 
-    const grs = getGrsPicker();
-    if (grs) {
-        try {
-            debugLog('[GroupSelection] Using STGroupResponderSelector picker.');
-            // Defer the call by one macrotask: GG's button click is still
-            // bubbling at this point, and GRS's outside-click handler would
-            // see the freshly-opened menu and close it immediately. Waiting
-            // one tick lets the originating click finish propagating first.
-            const picked = await new Promise((resolve) => setTimeout(resolve, 0))
-                .then(() => grs.pickCharacter());
-            if (!picked || typeof picked.chid !== 'number') {
-                debugLog('[GroupSelection] GRS picker returned no selection.');
-                return null;
-            }
-            // Normalise: prefer the locally-built member (it carries the
-            // correct triggerArg, avatar and muted flag). Fall back to a
-            // bare object if GRS reports a chid we don't know about.
-            const matched = members.find(m => m.chid === picked.chid);
-            return matched ?? {
-                chid: picked.chid,
-                name: typeof picked.name === 'string' && picked.name.length ? picked.name : String(picked.chid),
-                avatar: null,
-                muted: false,
-                triggerArg: JSON.stringify(typeof picked.name === 'string' && picked.name.length ? picked.name : String(picked.chid)),
-            };
-        } catch (error) {
-            console.warn(`[${extensionName}] GRS picker threw; falling back to GG selector.`, error);
-        }
-    }
-
-    debugLog('[GroupSelection] Using GG fallback picker.');
-    return ggFallbackPicker(members);
+    // Number labels so even duplicate character names select one exact member.
+    const uniqueLabels = members.map((member, index) => `${index + 1}. ${member.name}`);
+    const result = await context.executeSlashCommandsWithOptions(
+        `/buttons labels=${JSON.stringify(uniqueLabels)} "Select member to respond as"`,
+        { showOutput: false, handleExecutionErrors: true }
+    );
+    const selection = typeof result?.pipe === 'string' ? result.pipe : '';
+    const selectedIndex = uniqueLabels.indexOf(selection);
+    return selectedIndex >= 0 ? members[selectedIndex] : null;
 }

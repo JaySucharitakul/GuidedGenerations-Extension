@@ -34,8 +34,7 @@ const guidedResponse = async () => {
     const filledPrompt = fillPromptTemplate(promptTemplate, { input: originalInput });
     const depth = extension_settings[extensionName]?.depthPromptGuidedResponse ?? 0;
 
-    // For group chats, ask the user which member should respond. If GRS is
-    // installed, this delegates to it; otherwise GG's own selector is used.
+    // For group chats, ask which member should respond using the built-in dialog.
     // Resolves null when the user cancels.
     let selectedMember = null;
     if (isGroupChat()) {
