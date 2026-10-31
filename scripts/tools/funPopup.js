@@ -2,8 +2,40 @@
  * Fun Popup - Handles UI for fun prompts and interactions
  */
 
-import { getContext, extension_settings, extensionName, debugLog, requestCompletion, shouldUseDirectCall, generateNewSwipe, getPromptValue, fillPromptTemplate, pickGroupMember } from '../persistentGuides/guideExports.js'; // Import from central hub
+import { getContext, extension_settings, extensionName, debugLog, requestCompletion, shouldUseDirectCall, generateNewSwipe, getPromptValue, fillPromptTemplate } from '../persistentGuides/guideExports.js'; // Import from central hub
 import { appendSwipeToMessage } from '../utils/swipeHelpers.js';
+
+
+/**
+ * Use SillyTavern's built-in buttons dialog for Fun Prompts, as in the old
+ * extension. Resolve display names from character cards rather than filenames.
+ */
+async function pickFunPromptMember(context) {
+    const group = (context.groups || []).find(group => group.id === context.groupId);
+    const characters = Array.isArray(context.characters) ? context.characters : [];
+    const members = (Array.isArray(group?.members) ? group.members : [])
+        .map((avatar, index) => {
+            const character = characters.find(character => character?.avatar === avatar);
+            if (!character || typeof character.name !== 'string' || !character.name.length) return null;
+            return {
+                name: character.name,
+                triggerArg: String(index),
+            };
+        })
+        .filter(Boolean);
+    if (!members.length) {
+        debugLog('[FunPopup] No group members available; aborting fun prompt.');
+        return null;
+    }
+
+    const result = await context.executeSlashCommandsWithOptions(
+        `/buttons labels=${JSON.stringify(members.map(member => member.name))} "Select character to respond"`,
+        { showOutput: false, handleExecutionErrors: true }
+    );
+    const selection = typeof result?.pipe === 'string' ? result.pipe : '';
+    // Empty output means the dialog was cancelled. Never generate on cancel.
+    return members.find(member => member.name === selection) || null;
+}
 
 // Map to store fun prompts loaded from file
 let FUN_PROMPTS = {};
@@ -221,12 +253,10 @@ export class FunPopup {
 
         try {
             if (useDirectCall) {
-                // Check if it's a group chat and, if so, ask the user which
-                // member should respond (via GRS if installed, else GG's own
-                // selector with avatars).
+                // In group chats, select a member using ST's built-in dialog.
                 let selectedCharacter = '';
                 if (context.groupId) {
-                    const picked = await pickGroupMember();
+                    const picked = await pickFunPromptMember(context);
                     if (!picked) {
                         debugLog('[FunPopup] Group selection cancelled; aborting fun prompt.');
                         return;
@@ -282,9 +312,8 @@ export class FunPopup {
             } else {
                 let stscriptCommand = '';
                 if (context.groupId) {
-                    // Ask the user which member should respond (via GRS if
-                    // installed, else GG's own selector with avatars).
-                    const picked = await pickGroupMember();
+                    // Select a member using ST's built-in dialog.
+                    const picked = await pickFunPromptMember(context);
                     if (!picked) {
                         debugLog('[FunPopup] Group selection cancelled; aborting fun prompt.');
                         return;
